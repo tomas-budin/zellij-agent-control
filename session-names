@@ -1,0 +1,4 @@
+# <session-name> <label shown in the switcher>
+# Sessions without a line here show their real name.
+# base-repos Work: repos
+# code-reviews Reviews

@@ -1,0 +1,61 @@
+#!/bin/bash
+
+from_main=false
+if [ "$1" = "--main" ]; then
+    from_main=true
+    shift
+fi
+
+if [ $# -lt 1 ]; then
+    echo "Error: At least one argument is required."
+    echo "Usage: $0 [--main] <arg1> [arg2] [arg3] ..."
+    exit 1
+fi
+
+# If the first argument is a Jira URL, extract the ticket key
+first_arg="$1"
+if [[ "$first_arg" =~ ^https?://.*/browse/([A-Za-z0-9_]+-[0-9]+) ]]; then
+    first_arg="${BASH_REMATCH[1]}"
+fi
+
+# Initialize branch name with the first argument
+branch_name="$first_arg"
+shift
+
+# Append remaining arguments with underscore separator
+for arg in "$@"; do
+    branch_name="${branch_name}_${arg}"
+done
+
+# If the branch already exists locally, just switch to it.
+if git show-ref --verify --quiet "refs/heads/$branch_name"; then
+    echo "Branch '$branch_name' already exists; switching to it."
+    git checkout "$branch_name"
+elif [ "$from_main" = true ]; then
+    # Detect whether the remote uses main or master
+    if git ls-remote --heads origin main | grep -q main; then
+        main_branch="main"
+    elif git ls-remote --heads origin master | grep -q master; then
+        main_branch="master"
+    else
+        echo "Error: Could not find 'main' or 'master' branch on origin."
+        exit 1
+    fi
+
+    echo "Fetching origin/$main_branch..."
+    git fetch origin "$main_branch" || exit 1
+
+    echo "Creating git branch: $branch_name (from origin/$main_branch)"
+    git checkout -b "$branch_name" "origin/$main_branch"
+else
+    echo "Creating git branch: $branch_name"
+    git checkout -b "$branch_name"
+fi
+
+if [ $? -eq 0 ]; then
+    echo "Branch '$branch_name' ready."
+else
+    echo "Failed to switch to branch '$branch_name'."
+    exit 1
+fi
+

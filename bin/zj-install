@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Write the hook wiring under $ZJ_HOME/hooks into the coding agents' config.
+
+  zj install          write Claude Code settings and the Codex hooks link
+  zj install --check  report drift only, exit 1 when out of sync
+
+Claude Code: hooks whose command starts with "zj " are replaced inside
+~/.claude/settings.json; every other hook stays untouched.
+Codex: ~/.codex/hooks.json becomes a symlink to hooks/codex.json.
+"""
+import json
+import os
+import sys
+
+HOME = os.path.expanduser("~")
+ZJ_HOME = os.environ.get("ZJ_HOME") or os.path.join(HOME, ".config", "zellij")
+CLAUDE_SETTINGS = os.path.join(HOME, ".claude", "settings.json")
+CLAUDE_SOURCE = os.path.join(ZJ_HOME, "hooks", "claude.json")
+CODEX_HOOKS = os.path.join(HOME, ".codex", "hooks.json")
+CODEX_SOURCE = os.path.join(ZJ_HOME, "hooks", "codex.json")
+
+
+def load(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def owned(hook):
+    return hook.get("type") == "command" and hook.get("command", "").startswith("zj ")
+
+
+def merged_claude(settings, ours):
+    settings = json.loads(json.dumps(settings))
+    hooks = settings.setdefault("hooks", {})
+    for event, groups in ours.items():
+        kept = []
+        for group in hooks.get(event, []):
+            rest = [h for h in group.get("hooks", []) if not owned(h)]
+            if rest:
+                kept.append({**group, "hooks": rest})
+        hooks[event] = kept + groups
+    return settings
+
+
+def write_json(path, data):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def codex_linked():
+    return os.path.islink(CODEX_HOOKS) and os.path.realpath(CODEX_HOOKS) == os.path.realpath(CODEX_SOURCE)
+
+
+def report(target, path, state):
+    print(f"action=install target={target} path={path} state={state}")
+
+
+def main():
+    check = sys.argv[1:] == ["--check"]
+    if sys.argv[1:] and not check:
+        print(__doc__.strip(), file=sys.stderr)
+        sys.exit(2)
+    drift = 0
+
+    current = load(CLAUDE_SETTINGS)
+    wanted = merged_claude(current, load(CLAUDE_SOURCE))
+    if current == wanted:
+        report("claude", CLAUDE_SETTINGS, "in-sync")
+    else:
+        drift += 1
+        if not check:
+            write_json(CLAUDE_SETTINGS, wanted)
+        report("claude", CLAUDE_SETTINGS, "drift" if check else "done")
+
+    if codex_linked():
+        report("codex", CODEX_HOOKS, "in-sync")
+    else:
+        drift += 1
+        if not check:
+            if os.path.lexists(CODEX_HOOKS):
+                os.remove(CODEX_HOOKS)
+            os.symlink(CODEX_SOURCE, CODEX_HOOKS)
+        report("codex", CODEX_HOOKS, "drift" if check else "done")
+
+    sys.exit(1 if check and drift else 0)
+
+
+if __name__ == "__main__":
+    main()

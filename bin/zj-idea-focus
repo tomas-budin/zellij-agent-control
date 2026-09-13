@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Focus the IntelliJ (or other JetBrains IDE) window for the project at $1 (default: cwd).
+# Falls back to launching the project via the Toolbox `idea` script if no window matches.
+set -euo pipefail
+
+target="${1:-$PWD}"
+
+if [[ ! -d "$target" ]]; then
+  echo "idea-focus: not a directory: $target" >&2
+  exit 1
+fi
+
+if ! root=$(git -C "$target" rev-parse --show-toplevel 2>/dev/null); then
+  root=$(cd "$target" && pwd)
+fi
+
+# .idea/.name wins when the project was renamed away from its directory name.
+if [[ -f "$root/.idea/.name" ]]; then
+  name=$(tr -d '\n' < "$root/.idea/.name")
+else
+  name=$(basename "$root")
+fi
+
+# JetBrains IDEs are JVM apps: they only publish their accessibility window list
+# while the app is frontmost, so each candidate has to be activated before its
+# windows can be enumerated.
+found=$(osascript - "$name" <<'APPLESCRIPT'
+on run argv
+  set nm to item 1 of argv
+  set ides to {"idea", "pycharm", "webstorm", "goland", "rubymine", "phpstorm", "clion", "rider", "datagrip"}
+  tell application "System Events"
+    repeat with j from 1 to count of ides
+      set ide to item j of ides
+      if exists process ide then
+        tell process ide
+          set frontmost to true
+          repeat with k from 1 to 30
+            delay 0.1
+            if (count of windows) > 0 then exit repeat
+          end repeat
+          repeat with i from 1 to (count of windows)
+            set t to name of window i
+            if t is nm or t starts with (nm & " ") then
+              -- address the window by name: activating the app reorders indexes
+              set w to first window whose name is t
+              try
+                set value of attribute "AXMinimized" of w to false
+              end try
+              perform action "AXRaise" of w
+              return "ok"
+            end if
+          end repeat
+        end tell
+      end if
+    end repeat
+  end tell
+  return "nomatch"
+end run
+APPLESCRIPT
+)
+
+if [[ "$found" == "ok" ]]; then
+  exit 0
+fi
+
+echo "idea-focus: no open window for '$name', opening $root" >&2
+exec idea "$root"

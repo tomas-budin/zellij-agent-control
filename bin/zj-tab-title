@@ -1,0 +1,10 @@
+#!/bin/bash
+# Append " (<first 20 chars of git branch>)" to the focused zellij tab name.
+# Zellij ignores OSC titles on tabs that already have a name, so rename the tab explicitly.
+[ -n "$ZELLIJ" ] || exit 0
+b=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || exit 0
+cur=$(zellij action dump-layout 2>/dev/null | sed -nE 's/^ *tab name="([^"]*)".* focus=true.*/\1/p' | head -1)
+[ -n "$cur" ] || exit 0
+base=${cur%% (*}
+new="$base (${b:0:20})"
+[ "$new" = "$cur" ] || zellij action rename-tab "$new" 2>/dev/null || true

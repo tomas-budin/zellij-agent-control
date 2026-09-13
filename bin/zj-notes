@@ -1,0 +1,4 @@
+#!/bin/sh
+zellij list-sessions -n 2>/dev/null | awk '{print $1}' | grep -qx notes \
+    || zellij -l notes attach -b notes
+exec zellij attach notes

@@ -1,0 +1,20 @@
+env {
+    ZJ_WORKTREE "/Users/tomasbudin/work/repos"
+}
+layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        children
+        pane size=2 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+    tab name="fullstack" {
+        pane cwd="/Users/tomasbudin/work/repos" command="claude"
+    }
+    tab name="pb-ml-services" {
+        pane cwd="/Users/tomasbudin/work/repos/pb-ml-services" command="claude"
+    }
+}

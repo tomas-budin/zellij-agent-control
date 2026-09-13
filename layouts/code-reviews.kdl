@@ -1,0 +1,16 @@
+layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        children
+        pane size=2 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+    tab name="ghpeek" {
+        pane command="zsh" cwd="/Users/tomasbudin/scripts/ghpeek" borderless=true {
+            args "-i" "-c" "go run ./cmd/ghpeek/; exec zsh"
+        }
+    }
+}

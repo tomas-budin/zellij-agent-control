@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+#
+# zj wt — manage a per-name set of git worktrees across repos.
+#
+# A "set" called <name> lives in:  $REPOS_ROOT/worktrees-<name>/
+# Each repo's worktree inside it is named:  <repo>-<name>
+#
+# Source repos are the git repos directly under $REPOS_ROOT.
+#
+# Usage:
+# Actions accept their first letter as a shortcut (c/a/d/b).
+#   zj wt create   <name>      # pick repos (fzf), create worktrees, write zellij layout, start session
+#   zj wt add-repo <name>      # pick repos NOT yet in the set, add them, rewrite the layout
+#   zj wt delete   <name>      # remove the whole set (all worktrees) and its layout
+#   zj wt branch   <name> ARGS # branch off origin main/master in every worktree
+#   zj wt regenerate-zellij-layout <name>  # rewrite the zellij layout from the set folder
+#
+# The layout holds the env block, the "fullstack" tab and one tab per worktree.
+# The worktree-<name> zellij session is started in the background from the layout
+# when it is not running. A running session does not pick up layout changes:
+# open new tabs with the repo tab picker, or restart the session.
+#
+# Examples:
+#   zj wt create pulsar
+#   zj wt a pulsar
+#   zj wt delete pulsar
+#   zj wt b pulsar PROD-123 add cache        # branch PROD-123_add_cache everywhere
+#
+set -euo pipefail
+
+# ---- static config -----------------------------------------------------------
+# Root holding both the source repos and the worktrees-<name> folders.
+# Override by exporting REPOS_ROOT before calling.
+REPOS_ROOT="${REPOS_ROOT:-$HOME/work/repos}"
+
+# Where zellij layouts get written.
+ZELLIJ_LAYOUT_DIR="${ZELLIJ_LAYOUT_DIR:-$HOME/.config/zellij/layouts}"
+
+# Preferred order for repo tabs (by repo name, space-separated).
+# Listed repos appear first in this order; any others follow in directory order.
+# Repos not present in the set are ignored.
+WORKTREE_TAB_ORDER="${WORKTREE_TAB_ORDER:-pb-ml-services pb-navigation pb-universe pb-frontend}"
+
+# Helper used by the `branch` command to create/switch branches.
+CREATE_BRANCH_SCRIPT="${CREATE_BRANCH_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/zj-create-branch}"
+# ------------------------------------------------------------------------------
+
+die() { echo "error: $*" >&2; exit 1; }
+
+usage() {
+    cat >&2 <<EOF
+usage: zj wt <create|add-repo|delete|branch|regenerate-zellij-layout> <name> [args...]
+
+  create   (c)   pick repos interactively and create their worktrees
+  add-repo (a)   pick repos missing from the set and add them
+  delete   (d)   remove the whole set (all worktrees) and its zellij layout
+  branch   (b)   branch off origin main/master in every worktree (switches if it exists)
+  regenerate-zellij-layout (r)   rewrite the zellij layout from the set folder
+  <name>         name of the worktree set (e.g. pulsar)
+
+env overrides:
+  REPOS_ROOT          (default: \$HOME/work/repos)
+  ZELLIJ_LAYOUT_DIR   (default: \$HOME/.config/zellij/layouts)
+EOF
+    exit 1
+}
+
+# Resolve the default branch for a repo (prefers origin/HEAD, falls back main/master).
+default_branch() {
+    local repo="$1" b
+    b="$(git -C "$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+    b="${b#origin/}"
+    if [[ -z "$b" ]]; then
+        local c
+        for c in main master; do
+            if git -C "$repo" show-ref --verify --quiet "refs/heads/$c"; then b="$c"; break; fi
+        done
+    fi
+    echo "${b:-main}"
+}
+
+# The ref to detach onto — prefer the remote tip so worktrees start fresh.
+detach_ref() {
+    local repo="$1" b; b="$(default_branch "$repo")"
+    if git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$b"; then
+        echo "origin/$b"
+    else
+        echo "$b"
+    fi
+}
+
+# List source repos (dirs under REPOS_ROOT that are real git repos), one per line.
+list_source_repos() {
+    local d
+    for d in "$REPOS_ROOT"/*/; do
+        d="${d%/}"
+        [[ -d "$d/.git" || -f "$d/.git" ]] || continue
+        basename "$d"
+    done
+}
+
+# List repos already present in a set (strips the -<name> suffix back to repo name).
+list_set_repos() {
+    local set_dir="$1" name="$2" d
+    [[ -d "$set_dir" ]] || return 0
+    for d in "$set_dir"/*/; do
+        d="${d%/}"
+        [[ -d "$d/.git" || -f "$d/.git" ]] || continue
+        echo "$(basename "$d")" | sed "s/-${name}\$//"
+    done
+}
+
+# fzf multi-select over stdin; prints chosen lines.
+pick() {
+    local header="$1"
+    fzf --multi --height=60% --reverse \
+        --prompt="repos> " \
+        --header="$header"$'\n''(TAB to mark, ENTER to confirm, ESC to cancel)'
+}
+
+# Worktree dirs of a set, preferred repos first (WORKTREE_TAB_ORDER), then the rest in glob order.
+ordered_worktrees() {
+    local name="$1" set_dir="$2"
+    local d repo pref emitted=" "
+    for pref in $WORKTREE_TAB_ORDER; do
+        for d in "$set_dir"/*/; do
+            d="${d%/}"
+            [[ -d "$d/.git" || -f "$d/.git" ]] || continue
+            repo="$(basename "$d" | sed "s/-${name}\$//")"
+            if [[ "$repo" == "$pref" ]]; then
+                echo "$d"
+                emitted+="$d "
+            fi
+        done
+    done
+    for d in "$set_dir"/*/; do
+        d="${d%/}"
+        [[ -d "$d/.git" || -f "$d/.git" ]] || continue
+        [[ "$emitted" == *" $d "* ]] && continue
+        echo "$d"
+    done
+}
+
+# Make sure session worktree-<name> runs. Start it in the background from its layout if needed.
+ensure_session() {
+    local name="$1"
+    local session="worktree-${name}"
+    local layout_file="$ZELLIJ_LAYOUT_DIR/${session}.kdl"
+    local line
+    line="$(zellij list-sessions -n 2>/dev/null | awk -v s="$session" '$1==s')"
+    if [[ "$line" == *EXITED* ]]; then
+        echo "session $session is dead. Run 'zellij attach $session' to resurrect it," >&2
+        echo "or 'zellij delete-session $session' and retry." >&2
+        return 1
+    fi
+    if [[ -n "$line" ]]; then
+        echo "session $session already runs; it picks up the layout on its next start (or open tabs with the repo tab picker)"
+        return 0
+    fi
+
+    echo "==> starting session $session from $layout_file"
+    # Inside a zellij pane, "zellij -l" opens the layout as a tab in the current
+    # session. Drop the ZELLIJ_* vars so it creates a separate session instead.
+    env -u ZELLIJ -u ZELLIJ_SESSION_NAME -u ZELLIJ_PANE_ID \
+        zellij -l "$layout_file" attach -b "$session"
+    local i
+    for i in $(seq 1 50); do
+        zellij list-sessions -n 2>/dev/null | awk -v s="$session" '$1==s' | grep -q . && return 0
+        sleep 0.1
+    done
+    echo "session $session did not start" >&2
+    return 1
+}
+
+# Generate the zellij layout for a set: env block, the "fullstack" tab, then one
+# tab per worktree in ordered_worktrees order, each running claude.
+write_layout() {
+    local name="$1" set_dir="$2"
+    local layout_file="$ZELLIJ_LAYOUT_DIR/worktree-${name}.kdl"
+    mkdir -p "$ZELLIJ_LAYOUT_DIR"
+
+    {
+        # Session-wide env var; every pane in the layout can read the set's root path.
+        echo 'env {'
+        echo "    ZJ_WORKTREE \"$set_dir\""
+        echo '}'
+        echo
+        echo 'layout {'
+        echo '    default_tab_template {'
+        echo '        pane size=1 borderless=true {'
+        echo '            plugin location="zellij:tab-bar"'
+        echo '        }'
+        echo '        children'
+        echo '        pane size=2 borderless=true {'
+        echo '            plugin location="zellij:status-bar"'
+        echo '        }'
+        echo '    }'
+        echo "    tab name=\"fullstack\" {"
+        echo "        pane cwd=\"$set_dir\" command=\"claude\""
+        echo "    }"
+        local d
+        while IFS= read -r d; do
+            [[ -n "$d" ]] || continue
+            echo "    tab name=\"$(basename "$d")\" {"
+            echo "        pane cwd=\"$d\" command=\"claude\""
+            echo "    }"
+        done < <(ordered_worktrees "$name" "$set_dir")
+        echo '}'
+    } > "$layout_file"
+
+    echo "wrote layout: $layout_file"
+    echo "open with:    zellij --layout worktree-${name}"
+}
+
+# Copy the source repo's IDE project into a fresh worktree so IntelliJ opens it
+# without the import wizard. On first open IntelliJ registers the existing .venv
+# as a Python SDK named by its home-relative path ("~/work/.../.venv"); writing
+# that name up front makes the SDK reference resolve.
+seed_idea() {
+    local src="$1" dest="$2"
+    [[ -d "$src/.idea" ]] || return 0
+    echo "==> seeding .idea from $src"
+    rsync -a \
+        --exclude workspace.xml --exclude shelf/ --exclude libraries/ \
+        --exclude dataSources/ --exclude dataSources.local.xml \
+        --exclude httpRequests/ --exclude '*.un~' \
+        "$src/.idea/" "$dest/.idea/"
+    [[ -f "$dest/uv.lock" ]] || return 0
+
+    echo "==> uv sync in $dest"
+    (cd "$dest" && uv sync --frozen)
+
+    local old
+    old="$(sed -n 's/.*project-jdk-name="\([^"]*\)" project-jdk-type="Python SDK".*/\1/p' "$dest/.idea/misc.xml")"
+    [[ -n "$old" ]] || return 0
+    local new="$dest/.venv"
+    [[ "$dest" == "$HOME"/* ]] && new="~/${dest#"$HOME"/}/.venv"
+    echo "==> python sdk: '$old' -> '$new'"
+    OLD="$old" NEW="$new" perl -pi -e 's/\Q$ENV{OLD}\E/$ENV{NEW}/g' \
+        "$dest/.idea/misc.xml" "$dest"/.idea/*.iml
+}
+
+# Create a worktree for one repo (no-op if it already exists).
+add_worktree() {
+    local name="$1" repo="$2" set_dir="$3"
+    local src="$REPOS_ROOT/$repo"
+    local dest="$set_dir/${repo}-${name}"
+
+    if [[ -e "$dest" ]]; then
+        echo "skip: $dest already exists"
+        return 0
+    fi
+
+    local ref; ref="$(detach_ref "$src")"
+    echo "==> $repo : worktree at $dest (detached @ $ref)"
+    git -C "$src" worktree add --detach "$dest" "$ref"
+    seed_idea "$src" "$dest"
+}
+
+# Delete a whole set: deregister every worktree from its source repo, then nuke
+# the folder and the zellij layout.
+delete_set() {
+    local name="$1" set_dir="$2"
+    local d repo src
+
+    for d in "$set_dir"/*/; do
+        d="${d%/}"
+        [[ -d "$d/.git" || -f "$d/.git" ]] || continue
+        repo="$(basename "$d" | sed "s/-${name}\$//")"
+        src="$REPOS_ROOT/$repo"
+        if [[ -d "$src/.git" || -f "$src/.git" ]]; then
+            echo "==> removing worktree $d"
+            git -C "$src" worktree remove --force "$d" || rm -rf "$d"
+            git -C "$src" worktree prune
+        else
+            echo "==> source repo '$repo' gone; rm -rf $d"
+            rm -rf "$d"
+        fi
+    done
+
+    rm -rf "$set_dir"
+    echo "removed set folder: $set_dir"
+
+    local layout_file="$ZELLIJ_LAYOUT_DIR/worktree-${name}.kdl"
+    if [[ -f "$layout_file" ]]; then
+        rm -f "$layout_file"
+        echo "removed layout: $layout_file"
+    fi
+}
+
+main() {
+    [[ $# -ge 2 ]] || usage
+    local action="$1" name="$2"
+    shift 2
+    [[ -n "$name" ]] || usage
+
+    # Allow the first letter as a shortcut.
+    case "$action" in
+        c|create)      action="create" ;;
+        a|add-repo)    action="add-repo" ;;
+        d|delete)      action="delete" ;;
+        b|branch)      action="branch" ;;
+        r|regenerate-zellij-layout) action="regenerate-zellij-layout" ;;
+        *)             usage ;;
+    esac
+
+    # Only `branch` accepts extra args; everything else must be exhausted now.
+    [[ "$action" == "branch" || $# -eq 0 ]] || usage
+
+    command -v fzf >/dev/null   || die "fzf not found (brew install fzf)"
+    command -v git >/dev/null   || die "git not found"
+    [[ -d "$REPOS_ROOT" ]]      || die "REPOS_ROOT does not exist: $REPOS_ROOT"
+
+    local set_dir="$REPOS_ROOT/worktrees-${name}"
+
+    case "$action" in
+        create)
+            local candidates; candidates="$(list_source_repos)"
+            [[ -n "$candidates" ]] || die "no git repos found under $REPOS_ROOT"
+
+            local chosen
+            chosen="$(printf '%s\n' "$candidates" | pick "create worktree set '$name'")" || true
+            [[ -n "$chosen" ]] || die "nothing selected"
+
+            mkdir -p "$set_dir"
+            local repo
+            while IFS= read -r repo; do
+                [[ -n "$repo" ]] || continue
+                add_worktree "$name" "$repo" "$set_dir"
+            done <<< "$chosen"
+
+            write_layout "$name" "$set_dir"
+            ensure_session "$name"
+            ;;
+
+        add-repo)
+            [[ -d "$set_dir" ]] || die "set '$name' does not exist ($set_dir). Use 'create' first."
+
+            # missing = source repos minus repos already in the set
+            local have missing
+            have="$(list_set_repos "$set_dir" "$name" | sort -u)"
+            missing="$(comm -23 <(list_source_repos | sort -u) <(printf '%s\n' "$have"))"
+            [[ -n "$missing" ]] || die "nothing to add — set '$name' already has every source repo"
+
+            local chosen
+            chosen="$(printf '%s\n' "$missing" | pick "add repos to set '$name'")" || true
+            [[ -n "$chosen" ]] || die "nothing selected"
+
+            local repo
+            while IFS= read -r repo; do
+                [[ -n "$repo" ]] || continue
+                add_worktree "$name" "$repo" "$set_dir"
+            done <<< "$chosen"
+
+            write_layout "$name" "$set_dir"
+            ensure_session "$name"
+            ;;
+
+        regenerate-zellij-layout)
+            [[ -d "$set_dir" ]] || die "set '$name' does not exist ($set_dir). Use 'create' first."
+            write_layout "$name" "$set_dir"
+            ;;
+
+        delete)
+            [[ -d "$set_dir" ]] || die "set '$name' does not exist ($set_dir)."
+
+            echo "About to delete set '$name':"
+            echo "  folder: $set_dir"
+            list_set_repos "$set_dir" "$name" | sed 's/^/  worktree: /'
+            local layout_file="$ZELLIJ_LAYOUT_DIR/worktree-${name}.kdl"
+            [[ -f "$layout_file" ]] && echo "  layout: $layout_file"
+            echo
+            local reply
+            read -r -p "This is permanent. Type the set name to confirm: " reply
+            [[ "$reply" == "$name" ]] || die "confirmation mismatch — aborted, nothing deleted"
+
+            delete_set "$name" "$set_dir"
+            ;;
+
+        branch)
+            [[ -d "$set_dir" ]] || die "set '$name' does not exist ($set_dir). Use 'create' first."
+            [[ $# -ge 1 ]] || die "branch needs at least one branch-name argument"
+            [[ -x "$CREATE_BRANCH_SCRIPT" ]] || die "zj-create-branch not executable at: $CREATE_BRANCH_SCRIPT"
+
+            local d rc=0
+            for d in "$set_dir"/*/; do
+                d="${d%/}"
+                [[ -d "$d/.git" || -f "$d/.git" ]] || continue
+                echo "==> $(basename "$d")"
+                ( cd "$d" && "$CREATE_BRANCH_SCRIPT" --main "$@" ) || { rc=1; echo "!! failed in $(basename "$d")"; }
+            done
+            [[ $rc -eq 0 ]] || die "one or more worktrees failed"
+            ;;
+
+        *)
+            usage
+            ;;
+    esac
+
+    echo "done."
+}
+
+main "$@"

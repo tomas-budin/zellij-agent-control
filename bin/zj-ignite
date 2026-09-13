@@ -1,0 +1,11 @@
+#!/bin/sh
+: "${ZJ_HOME:=$HOME/.config/zellij}"
+skip=" notes "
+existing=$(zellij list-sessions -n 2>/dev/null | awk '{print $1}')
+for layout in "$ZJ_HOME"/layouts/*.kdl; do
+    name=$(basename "$layout" .kdl)
+    case "$skip" in *" $name "*) continue ;; esac
+    printf '%s\n' "$existing" | grep -qx "$name" && continue
+    zellij -l "$layout" attach -b "$name"
+done
+exec zellij attach base-repos

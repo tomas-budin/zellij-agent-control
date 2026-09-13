@@ -1,0 +1,34 @@
+#!/bin/sh
+# Pick a repo folder under $ZJ_WORKTREE with fzf and open it as a new tab.
+# "fullstack" opens $ZJ_WORKTREE itself.
+# Only sessions started from a worktree layout set ZJ_WORKTREE.
+if [ -z "$ZJ_WORKTREE" ] || [ ! -d "$ZJ_WORKTREE" ]; then
+    echo "ZJ_WORKTREE is not set or not a directory: '$ZJ_WORKTREE'" >&2
+    sleep 2
+    zellij action hide-floating-panes
+    exit 1
+fi
+repo=$( { echo fullstack; find "$ZJ_WORKTREE" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -exec basename {} \; | sort -f; } \
+    | fzf --prompt='repo> ' --reverse --no-info)
+zellij action hide-floating-panes
+[ -n "$repo" ] || exit 0
+if [ "$repo" = fullstack ]; then
+    dir="$ZJ_WORKTREE"
+else
+    dir="$ZJ_WORKTREE/$repo"
+fi
+# One pane running Claude Code. The template keeps the bars.
+zellij action new-tab --layout-string "layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location=\"zellij:tab-bar\"
+        }
+        children
+        pane size=2 borderless=true {
+            plugin location=\"zellij:status-bar\"
+        }
+    }
+    tab name=\"$repo\" {
+        pane cwd=\"$dir\" command=\"claude\"
+    }
+}" >/dev/null

@@ -1,0 +1,6 @@
+alias i='zj idea-focus'
+alias nb='zj create-branch'
+alias nbm='zj create-branch --main'
+alias wt='zj wt'
+alias ignite='zj ignite'
+alias notes='zj notes'

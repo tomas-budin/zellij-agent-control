@@ -1,0 +1,13 @@
+#!/bin/sh
+ZJ_HOME=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+export ZJ_HOME
+cmd=$1
+if [ -z "$cmd" ] || [ ! -x "$ZJ_HOME/bin/zj-$cmd" ]; then
+    echo "usage: zj <command> [args...]" >&2
+    for f in "$ZJ_HOME"/bin/zj-*; do
+        echo "  ${f##*/zj-}" >&2
+    done
+    exit 2
+fi
+shift
+exec "$ZJ_HOME/bin/zj-$cmd" "$@"

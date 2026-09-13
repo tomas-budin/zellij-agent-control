@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Track which coding agents are running and which hold an uncleared conversation, per zellij session.
+
+Usage:
+  zj agent-state hook <claude|codex>   hook entry point, reads the event JSON from stdin
+  zj agent-state summary               one line per zellij session: name<TAB>running<TAB>waiting
+                                    waiting = uncleared conversation whose agent is not running
+  zj agent-state list                  one line per live agent, for debugging
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+
+STATE_DIR = os.path.expanduser("~/.local/state/agent-state")
+EVENT_LOG = os.path.join(STATE_DIR, "events.log")
+LIFECYCLE = ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "Interrupt", "PermissionRequest")
+
+
+def proc_table():
+    out = subprocess.run(["ps", "-axo", "pid=,ppid=,lstart=,command="], capture_output=True, text=True).stdout
+    table = {}
+    for line in out.splitlines():
+        parts = line.split(None, 7)
+        if len(parts) < 8:
+            continue
+        table[int(parts[0])] = (int(parts[1]), " ".join(parts[2:7]), parts[7])
+    return table
+
+
+def harness_pid(table, tool):
+    pid = os.getppid()
+    for _ in range(8):
+        entry = table.get(pid)
+        if entry is None:
+            break
+        ppid, start, command = entry
+        names = [os.path.basename(t) for t in command.split()[:2]]
+        if tool in names:
+            return pid, start
+        pid = ppid
+    ppid, start, _ = table.get(os.getppid(), (0, "", ""))
+    return os.getppid(), start
+
+
+def read_state(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_state(path, state):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, path)
+
+
+def log_event(tool, pid, data):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        if os.path.getsize(EVENT_LOG) > 1_000_000:
+            os.replace(EVENT_LOG, EVENT_LOG + ".1")
+    except OSError:
+        pass
+    detail = {k: v for k, v in data.items() if k not in ("hook_event_name", "cwd", "transcript_path", "prompt", "tool_input", "tool_response")}
+    with open(EVENT_LOG, "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} tool={tool} pid={pid} event={data.get('hook_event_name')} {json.dumps(detail, default=str)}\n")
+
+
+def hook(tool):
+    data = json.load(sys.stdin)
+    event = data.get("hook_event_name", "")
+    pid, start = harness_pid(proc_table(), tool)
+    path = os.path.join(STATE_DIR, f"{tool}-{pid}.json")
+    if event in LIFECYCLE:
+        log_event(tool, pid, data)
+    state = read_state(path) or {"open": False, "running": False}
+    if event == "SessionEnd":
+        if state.get("session_id") in (None, data.get("session_id")):
+            remove(path)
+        return
+    state.update(
+        tool=tool,
+        pid=pid,
+        proc_start=start,
+        zellij=os.environ.get("ZELLIJ_SESSION_NAME"),
+        pane=os.environ.get("ZELLIJ_PANE_ID"),
+        session_id=data.get("session_id"),
+        cwd=data.get("cwd"),
+        event=event,
+        updated=time.time(),
+    )
+    if event == "SessionStart":
+        source = data.get("source")
+        if source == "resume":
+            state.update(open=True, running=False)
+        elif source != "compact":
+            state.update(open=False, running=False)
+    elif event in ("UserPromptSubmit", "PostToolUse"):
+        state.update(open=True, running=True)
+    elif event in ("Stop", "Interrupt", "PermissionRequest"):
+        state.update(open=True, running=False)
+    elif event == "Notification":
+        kind = data.get("notification_type")
+        if kind == "permission_prompt":
+            state.update(open=True, running=False)
+        elif kind == "idle_prompt":
+            state["running"] = False
+    write_state(path, state)
+
+
+def remove(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def live_states():
+    if not os.path.isdir(STATE_DIR):
+        return []
+    table = proc_table()
+    states = []
+    for name in os.listdir(STATE_DIR):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(STATE_DIR, name)
+        state = read_state(path)
+        entry = table.get(state.get("pid")) if state else None
+        if entry is None or entry[1] != state.get("proc_start"):
+            remove(path)
+            continue
+        states.append(state)
+    return states
+
+
+def summary():
+    counts = {}
+    for state in live_states():
+        zellij = state.get("zellij")
+        if not zellij:
+            continue
+        running, waiting = counts.setdefault(zellij, [0, 0])
+        if state.get("running"):
+            running += 1
+        elif state.get("open"):
+            waiting += 1
+        counts[zellij] = [running, waiting]
+    for zellij, (running, waiting) in sorted(counts.items()):
+        print(f"{zellij}\t{running}\t{waiting}")
+
+
+def list_states():
+    for state in sorted(live_states(), key=lambda s: (s.get("zellij") or "", s.get("pid"))):
+        flags = ("R" if state.get("running") else "-") + ("O" if state.get("open") else "-")
+        print(f"{state.get('zellij') or '-':18} {state['tool']:6} {state['pid']:>6} {flags} {state.get('event', ''):18} {state.get('cwd', '')}")
+
+
+def main():
+    try:
+        if len(sys.argv) >= 3 and sys.argv[1] == "hook":
+            hook(sys.argv[2])
+        elif len(sys.argv) == 2 and sys.argv[1] == "summary":
+            summary()
+        elif len(sys.argv) == 2 and sys.argv[1] == "list":
+            list_states()
+        else:
+            print(__doc__.strip(), file=sys.stderr)
+            sys.exit(2)
+    except Exception:
+        if sys.argv[1:2] != ["hook"]:
+            raise
+
+
+if __name__ == "__main__":
+    main()
